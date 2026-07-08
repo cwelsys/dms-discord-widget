@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import signal
+import socket
 import struct
 import sys
 import urllib.error
@@ -262,9 +263,11 @@ class BridgeServer:
         self._server: asyncio.AbstractServer | None = None
         self._clients: set[asyncio.StreamWriter] = set()
         self._on_command: Any = None  # callback: async (dict) -> None
+        self._on_client: Any = None  # callback: async (StreamWriter) -> None
 
-    async def start(self, on_command: Any) -> None:
+    async def start(self, on_command: Any, on_client: Any = None) -> None:
         self._on_command = on_command
+        self._on_client = on_client
         # Remove stale socket file.
         try:
             os.unlink(self.socket_path)
@@ -282,6 +285,8 @@ class BridgeServer:
         self._clients.add(writer)
         log.info("QML client connected (total: %d)", len(self._clients))
         await self._send_one(writer, {"type": "ready"})
+        if self._on_client:
+            await self._on_client(writer)
 
         try:
             while True:
@@ -303,6 +308,10 @@ class BridgeServer:
             except Exception:
                 pass
             log.info("QML client disconnected (total: %d)", len(self._clients))
+
+    async def send_to(self, writer: asyncio.StreamWriter, msg: dict[str, Any]) -> None:
+        """Send a JSON-line message to a single client."""
+        await self._send_one(writer, msg)
 
     async def _send_one(self, writer: asyncio.StreamWriter, msg: dict[str, Any]) -> None:
         """Send a JSON-line message to a single client."""
@@ -363,8 +372,11 @@ class DiscordBridge:
         self.tokens = TokenManager()
         self.server = BridgeServer(socket_path)
         self.authenticated = False
+        self.current_user: dict[str, Any] = {}
         self.current_channel_id: str | None = None
+        self.current_channel: dict[str, Any] | None = None
         self.voice_users: dict[str, dict[str, Any]] = {}
+        self.voice_settings: dict[str, Any] = {"mute": False, "deaf": False}
         self._pending: dict[str, str] = {}  # nonce -> command name
         self._shutdown = False
         self._discord_task: asyncio.Task[None] | None = None
@@ -376,7 +388,7 @@ class DiscordBridge:
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, lambda: asyncio.ensure_future(self.shutdown()))
 
-        await self.server.start(self._handle_qml_command)
+        await self.server.start(self._handle_qml_command, self._on_client_connected)
         log.info("Bridge running, waiting for QML client...")
 
         # Keep running until shutdown.
@@ -388,6 +400,35 @@ class DiscordBridge:
         self._shutdown = True
         self.discord.close()
         await self.server.stop()
+
+    async def _on_client_connected(self, writer: asyncio.StreamWriter) -> None:
+        """Replay current state to a client that connected after startup.
+
+        Clients (bar widgets, the daemon) come and go as monitors sleep and
+        wake; without a replay a late-joining client would show stale state
+        until the next Discord event happened to fire.
+        """
+        if not self.authenticated:
+            return
+        await self.server.send_to(writer, {
+            "type": "auth_complete",
+            "user": self.current_user,
+            "access_token": self.tokens.access_token or "",
+        })
+        if self.current_channel:
+            await self.server.send_to(writer, {
+                "type": "voice_channel",
+                "channel": self.current_channel,
+            })
+            await self.server.send_to(writer, {
+                "type": "voice_state",
+                "users": list(self.voice_users.values()),
+            })
+        await self.server.send_to(writer, {
+            "type": "voice_settings",
+            "mute": self.voice_settings.get("mute", False),
+            "deaf": self.voice_settings.get("deaf", False),
+        })
 
     # -- Discord connection --
 
@@ -434,8 +475,11 @@ class DiscordBridge:
         finally:
             self.discord.close()
             self.authenticated = False
+            self.current_user = {}
             self.current_channel_id = None
+            self.current_channel = None
             self.voice_users.clear()
+            self.voice_settings = {"mute": False, "deaf": False}
             await self.server.send({"type": "disconnected", "reason": "Discord connection lost"})
             log.info("Discord disconnected")
 
@@ -504,14 +548,15 @@ class DiscordBridge:
         elif cmd_name == "AUTHENTICATE":
             user = response_data.get("user", {})
             self.authenticated = True
+            self.current_user = {
+                "id": user.get("id", ""),
+                "username": user.get("username", ""),
+                "avatar": user.get("avatar", ""),
+            }
             token = self.tokens.access_token or ""
             await self.server.send({
                 "type": "auth_complete",
-                "user": {
-                    "id": user.get("id", ""),
-                    "username": user.get("username", ""),
-                    "avatar": user.get("avatar", ""),
-                },
+                "user": self.current_user,
                 "access_token": token,
             })
             log.info("Authenticated as %s", user.get("username", "?"))
@@ -529,18 +574,14 @@ class DiscordBridge:
             else:
                 await self._on_voice_channel_leave()
 
-        elif cmd_name == "GET_VOICE_SETTINGS":
-            await self.server.send({
-                "type": "voice_settings",
+        elif cmd_name in ("GET_VOICE_SETTINGS", "SET_VOICE_SETTINGS"):
+            self.voice_settings = {
                 "mute": response_data.get("mute", False),
                 "deaf": response_data.get("deaf", False),
-            })
-
-        elif cmd_name == "SET_VOICE_SETTINGS":
+            }
             await self.server.send({
                 "type": "voice_settings",
-                "mute": response_data.get("mute", False),
-                "deaf": response_data.get("deaf", False),
+                **self.voice_settings,
             })
 
     async def _send_discord_command(
@@ -603,15 +644,16 @@ class DiscordBridge:
             await self._unsubscribe_channel_events(self.current_channel_id)
 
         self.current_channel_id = channel_id
+        self.current_channel = {
+            "id": channel_id,
+            "name": channel_name,
+            "guild_id": guild_id,
+        }
         self.voice_users.clear()
 
         await self.server.send({
             "type": "voice_channel",
-            "channel": {
-                "id": channel_id,
-                "name": channel_name,
-                "guild_id": guild_id,
-            },
+            "channel": self.current_channel,
         })
 
         # Parse initial voice states if provided.
@@ -645,6 +687,7 @@ class DiscordBridge:
         if self.current_channel_id:
             await self._unsubscribe_channel_events(self.current_channel_id)
         self.current_channel_id = None
+        self.current_channel = None
         self.voice_users.clear()
         await self.server.send({"type": "voice_channel", "channel": None})
 
@@ -722,10 +765,13 @@ class DiscordBridge:
             await self.server.send({"type": "speaking", "user_id": uid, "speaking": False})
 
         elif evt == "VOICE_SETTINGS_UPDATE":
-            await self.server.send({
-                "type": "voice_settings",
+            self.voice_settings = {
                 "mute": data.get("mute", False),
                 "deaf": data.get("deaf", False),
+            }
+            await self.server.send({
+                "type": "voice_settings",
+                **self.voice_settings,
             })
 
     # -- QML command handler --
@@ -780,12 +826,23 @@ class DiscordBridge:
             await self.shutdown()
 
     async def _do_connect_flow(self, cached_token: str) -> None:
-        """Full connection flow: connect, then try cached token or request auth."""
-        if not await self._connect_discord():
+        """Full connection flow: connect, then try cached token or request auth.
+
+        Idempotent: every client (daemon and each bar widget) sends `connect`
+        when it attaches, so repeat calls while already connected or mid-auth
+        must not tear down or duplicate anything.
+        """
+        if self.discord.connected:
+            if self.authenticated or "AUTHENTICATE" in self._pending.values():
+                # Already connected (or auth in flight); new clients get
+                # state via the connection replay.
+                return
+        elif not await self._connect_discord():
             return
 
-        # Start reading from Discord in background.
-        self._discord_task = asyncio.create_task(self._discord_read_loop())
+        # Start reading from Discord in background (only one loop).
+        if self._discord_task is None or self._discord_task.done():
+            self._discord_task = asyncio.create_task(self._discord_read_loop())
 
         # Try cached token.
         token = cached_token or self.tokens.load()
@@ -800,6 +857,26 @@ class DiscordBridge:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def another_instance_running(socket_path: str) -> bool:
+    """True if a live bridge already accepts connections on socket_path.
+
+    Multiple QML components (daemon surface plus one widget per monitor) may
+    all try to spawn the bridge; only the first may own the socket, the rest
+    must exit instead of unlinking and stealing it.
+    """
+    if not os.path.exists(socket_path):
+        return False
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(1.0)
+    try:
+        probe.connect(socket_path)
+        return True
+    except OSError:
+        return False  # stale socket file; safe to take over
+    finally:
+        probe.close()
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         xdg_runtime = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
@@ -808,6 +885,10 @@ def main() -> None:
         socket_path = sys.argv[1]
 
     client_id = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_CLIENT_ID
+
+    if another_instance_running(socket_path):
+        log.info("Another bridge already owns %s; exiting", socket_path)
+        sys.exit(0)
 
     bridge = DiscordBridge(socket_path, client_id)
     asyncio.run(bridge.run())

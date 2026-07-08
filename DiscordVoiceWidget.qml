@@ -28,6 +28,15 @@ PluginComponent {
     readonly property string clientId: "207646673902501888"
     readonly property int maxBarAvatars: parseInt(pluginData.maxBarAvatars) || 5
 
+    // On DMS >= 1.5 the daemon surface owns the bridge process and the IPC
+    // handler (it survives bar reloads on monitor sleep/wake; a per-widget
+    // IpcHandler leaves a stale "discord" target behind when its bar window
+    // is destroyed). On older DMS without composite plugin support this is
+    // false and the widget self-hosts both, as before.
+    readonly property bool daemonMode: !!(pluginService
+        && pluginService.pluginDaemonComponents
+        && pluginService.pluginDaemonComponents["discordVoice"])
+
     // --- Computed ---
     readonly property bool inVoice: currentChannel !== null && currentChannel !== undefined
     readonly property bool isMuted: voiceSettings.mute || false
@@ -84,6 +93,9 @@ PluginComponent {
         }
 
         onExited: (exitCode) => {
+            // Exit 0 means another bridge instance already owns the socket;
+            // just keep using it as a client.
+            if (exitCode === 0) return
             console.warn("DiscordVoice bridge exited:", exitCode)
             root.bridgeReady = false
             root.authenticated = false
@@ -94,18 +106,38 @@ PluginComponent {
     }
 
     // Start bridge after a short delay so the socket path is ready
-    // before DankSocket tries to connect.
+    // before DankSocket tries to connect. In daemon mode the daemon
+    // surface owns the process instead.
     Timer {
         id: bridgeStartTimer
         interval: 100
         running: true
-        onTriggered: bridgeProcess.running = true
+        onTriggered: {
+            if (!root.daemonMode) {
+                bridgeProcess.running = true
+            }
+        }
     }
 
     Timer {
         id: bridgeRestartTimer
         interval: 3000
         onTriggered: bridgeProcess.running = true
+    }
+
+    // Legacy-mode watchdog: if the widget instance that owned the bridge
+    // process was destroyed (bar reload on monitor sleep/wake), surviving
+    // instances bring the bridge back up. Safe against races - extra
+    // bridge processes exit immediately when the socket is already owned.
+    Timer {
+        interval: 5000
+        repeat: true
+        running: !root.daemonMode
+        onTriggered: {
+            if (!bridgeSocket.linkUp && !bridgeProcess.running) {
+                bridgeProcess.running = true
+            }
+        }
     }
 
     // =====================================================================
@@ -131,11 +163,13 @@ PluginComponent {
         }
     }
 
-    // Connect socket after bridge process has had time to create its socket file.
+    // Connect socket after the bridge (ours or the daemon's) has had time
+    // to create its socket file. DankSocket retries with backoff until the
+    // bridge is up, so a fixed delay is safe in both modes.
     Timer {
         id: socketConnectTimer
         interval: 800
-        running: bridgeProcess.running
+        running: true
         onTriggered: {
             console.warn("DiscordVoice: connecting socket to bridge")
             bridgeSocket.connected = true
@@ -218,50 +252,57 @@ PluginComponent {
 
     // =====================================================================
     // IPC Handler (for keybinds: dms ipc call discord ...)
+    // Legacy mode only - in daemon mode the daemon surface registers it,
+    // since a handler tied to a bar widget goes stale when bar windows are
+    // recreated on monitor sleep/wake.
     // =====================================================================
 
-    IpcHandler {
-        target: "discord"
+    Loader {
+        active: !root.daemonMode
 
-        function toggleMute(): string {
-            root.sendBridgeCommand({cmd: "set_voice_settings", mute: !root.isMuted})
-            return root.isMuted ? "UNMUTED" : "MUTED"
-        }
+        sourceComponent: IpcHandler {
+            target: "discord"
 
-        function toggleDeafen(): string {
-            root.sendBridgeCommand({cmd: "set_voice_settings", deaf: !root.isDeafened})
-            return root.isDeafened ? "UNDEAFENED" : "DEAFENED"
-        }
+            function toggleMute(): string {
+                root.sendBridgeCommand({cmd: "set_voice_settings", mute: !root.isMuted})
+                return root.isMuted ? "UNMUTED" : "MUTED"
+            }
 
-        function muteOn(): string {
-            root.sendBridgeCommand({cmd: "set_voice_settings", mute: true})
-            return "MUTE_ON"
-        }
+            function toggleDeafen(): string {
+                root.sendBridgeCommand({cmd: "set_voice_settings", deaf: !root.isDeafened})
+                return root.isDeafened ? "UNDEAFENED" : "DEAFENED"
+            }
 
-        function muteOff(): string {
-            root.sendBridgeCommand({cmd: "set_voice_settings", mute: false})
-            return "MUTE_OFF"
-        }
+            function muteOn(): string {
+                root.sendBridgeCommand({cmd: "set_voice_settings", mute: true})
+                return "MUTE_ON"
+            }
 
-        function deafenOn(): string {
-            root.sendBridgeCommand({cmd: "set_voice_settings", deaf: true})
-            return "DEAFEN_ON"
-        }
+            function muteOff(): string {
+                root.sendBridgeCommand({cmd: "set_voice_settings", mute: false})
+                return "MUTE_OFF"
+            }
 
-        function deafenOff(): string {
-            root.sendBridgeCommand({cmd: "set_voice_settings", deaf: false})
-            return "DEAFEN_OFF"
-        }
+            function deafenOn(): string {
+                root.sendBridgeCommand({cmd: "set_voice_settings", deaf: true})
+                return "DEAFEN_ON"
+            }
 
-        function status(): string {
-            if (!root.authenticated) return "NOT_AUTHENTICATED"
-            if (!root.inVoice) return "NOT_IN_VOICE"
-            return JSON.stringify({
-                channel: root.currentChannel ? root.currentChannel.name : "",
-                users: root.voiceUsers.length,
-                muted: root.isMuted,
-                deafened: root.isDeafened
-            })
+            function deafenOff(): string {
+                root.sendBridgeCommand({cmd: "set_voice_settings", deaf: false})
+                return "DEAFEN_OFF"
+            }
+
+            function status(): string {
+                if (!root.authenticated) return "NOT_AUTHENTICATED"
+                if (!root.inVoice) return "NOT_IN_VOICE"
+                return JSON.stringify({
+                    channel: root.currentChannel ? root.currentChannel.name : "",
+                    users: root.voiceUsers.length,
+                    muted: root.isMuted,
+                    deafened: root.isDeafened
+                })
+            }
         }
     }
 
