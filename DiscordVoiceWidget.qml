@@ -54,8 +54,19 @@ PluginComponent {
         return "https://cdn.discordapp.com/avatars/" + userId + "/" + avatarHash + ".png?size=64"
     }
 
+    // Never log OAuth tokens: on systemd setups console output lands in
+    // the journal, where any journal reader could lift a live token.
+    function redactForLog(msg) {
+        if (!msg || typeof msg !== "object") return JSON.stringify(msg)
+        const copy = Object.assign({}, msg)
+        for (const key of ["token", "access_token"]) {
+            if (copy[key]) copy[key] = "<redacted>"
+        }
+        return JSON.stringify(copy)
+    }
+
     function sendBridgeCommand(cmd) {
-        console.warn("DiscordVoice: sendBridgeCommand", JSON.stringify(cmd))
+        console.warn("DiscordVoice: sendBridgeCommand", redactForLog(cmd))
         bridgeSocket.send(cmd)
     }
 
@@ -181,7 +192,7 @@ PluginComponent {
     // =====================================================================
 
     function handleBridgeMessage(msg) {
-        console.warn("DiscordVoice: bridge msg:", JSON.stringify(msg))
+        console.warn("DiscordVoice: bridge msg:", redactForLog(msg))
         switch (msg.type) {
         case "ready":
             bridgeReady = true

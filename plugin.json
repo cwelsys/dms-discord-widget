@@ -2,7 +2,7 @@
     "id": "discordVoice",
     "name": "Discord Voice Widget",
     "description": "Show Discord voice channel participants in DankBar with speaking/mute indicators and voice controls",
-    "version": "1.1.0",
+    "version": "1.1.1",
     "author": "PandorasFox",
     "type": "widget",
     "capabilities": [
