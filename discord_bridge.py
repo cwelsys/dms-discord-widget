@@ -35,6 +35,9 @@ DEFAULT_CLIENT_ID = "207646673902501888"
 OAUTH_SCOPES = ["rpc", "rpc.voice.read", "rpc.voice.write"]
 TOKEN_EXCHANGE_URL = "https://streamkit.discord.com/overlay/token"
 
+# How often the background loop retries reaching Discord while unauthenticated.
+RECONNECT_INTERVAL = 5.0
+
 # Discord IPC opcodes.
 OP_HANDSHAKE = 0
 OP_FRAME = 1
@@ -207,6 +210,8 @@ class TokenManager:
     def load(self) -> str | None:
         """Load cached access token from disk."""
         try:
+            # Files written by older plugin versions used umask defaults.
+            os.chmod(self._cache_path, 0o600)
             with open(self._cache_path) as f:
                 data = json.load(f)
                 self.access_token = data.get("access_token")
@@ -215,10 +220,11 @@ class TokenManager:
             return None
 
     def save(self, token: str) -> None:
-        """Save access token to disk."""
+        """Save access token to disk (owner-readable only)."""
         self.access_token = token
         os.makedirs(os.path.dirname(self._cache_path), exist_ok=True)
-        with open(self._cache_path, "w") as f:
+        fd = os.open(self._cache_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
             json.dump({"access_token": token}, f)
 
     def clear(self) -> None:
@@ -298,7 +304,8 @@ class BridgeServer:
                     if self._on_command:
                         await self._on_command(msg)
                 except json.JSONDecodeError:
-                    log.warning("Bad JSON from QML: %s", line[:200])
+                    # Don't echo the raw line: commands can carry the token.
+                    log.warning("Bad JSON from QML (%d bytes)", len(line))
         except (ConnectionResetError, asyncio.IncompleteReadError):
             pass
         finally:
@@ -378,6 +385,7 @@ class DiscordBridge:
         self.voice_users: dict[str, dict[str, Any]] = {}
         self.voice_settings: dict[str, Any] = {"mute": False, "deaf": False}
         self._pending: dict[str, str] = {}  # nonce -> command name
+        self._reauth_attempted = False
         self._shutdown = False
         self._discord_task: asyncio.Task[None] | None = None
 
@@ -391,15 +399,50 @@ class DiscordBridge:
         await self.server.start(self._handle_qml_command, self._on_client_connected)
         log.info("Bridge running, waiting for QML client...")
 
+        reconnect_task = asyncio.create_task(self._reconnect_loop())
+
         # Keep running until shutdown.
         while not self._shutdown:
             await asyncio.sleep(1)
+
+        reconnect_task.cancel()
 
     async def shutdown(self) -> None:
         log.info("Shutting down...")
         self._shutdown = True
         self.discord.close()
         await self.server.stop()
+
+    async def _reconnect_loop(self) -> None:
+        """Keep trying to reach Discord in the background until authenticated.
+
+        The widget/daemon commonly starts before Discord is running (e.g. at
+        login), or Discord gets restarted underneath us. Without this, the
+        first connect attempt fails and the user is left having to click
+        "Authorize" once Discord finally appears. Instead, whenever a client
+        is attached, we hold a previously-approved token, and we're not
+        already authenticated, silently retry connect + authenticate.
+
+        We only retry when a cached token exists: fresh authorization needs
+        Discord's consent UI, which must not be triggered unprompted.
+        """
+        while not self._shutdown:
+            await asyncio.sleep(RECONNECT_INTERVAL)
+            if self._shutdown or not self.server.has_client:
+                continue
+            if self.discord.connected and self.authenticated:
+                continue
+            # Auth already in flight; let it resolve before retrying.
+            pending = self._pending.values()
+            if "AUTHENTICATE" in pending or "AUTHORIZE" in pending:
+                continue
+            # No prior consent means we can't authenticate silently.
+            if not (self.tokens.access_token or self.tokens.load()):
+                continue
+            try:
+                await self._do_connect_flow(self.tokens.access_token or "", quiet=True)
+            except Exception as e:
+                log.debug("Background reconnect attempt failed: %s", e)
 
     async def _on_client_connected(self, writer: asyncio.StreamWriter) -> None:
         """Replay current state to a client that connected after startup.
@@ -432,10 +475,16 @@ class DiscordBridge:
 
     # -- Discord connection --
 
-    async def _connect_discord(self) -> bool:
-        """Connect and handshake with Discord.  Returns True on success."""
+    async def _connect_discord(self, quiet: bool = False) -> bool:
+        """Connect and handshake with Discord.  Returns True on success.
+
+        When `quiet` is set (background reconnect attempts), failures are not
+        broadcast to QML: Discord simply isn't up yet, and surfacing an error
+        on every retry would spam the widget's log.
+        """
         if not await self.discord.connect():
-            await self.server.send({"type": "error", "error": "Discord not running or IPC unavailable"})
+            if not quiet:
+                await self.server.send({"type": "error", "error": "Discord not running or IPC unavailable"})
             return False
         try:
             await self.discord.handshake(self.client_id)
@@ -444,7 +493,8 @@ class DiscordBridge:
         except Exception as e:
             log.error("Handshake failed: %s", e)
             self.discord.close()
-            await self.server.send({"type": "error", "error": f"Handshake failed: {e}"})
+            if not quiet:
+                await self.server.send({"type": "error", "error": f"Handshake failed: {e}"})
             return False
 
     async def _discord_read_loop(self) -> None:
@@ -496,17 +546,35 @@ class DiscordBridge:
             log.error("Discord error: %s", message)
 
             # If this error is the response to a pending AUTHENTICATE, the
-            # cached token is bad (expired/revoked). Clear it and ask the
-            # client to re-authorize so the UI can recover.
+            # cached token is bad (expired/revoked). Clear it and try a
+            # silent re-authorization: AUTHORIZE is sent with prompt "none",
+            # so Discord re-issues a code without any consent UI as long as
+            # the user previously approved these scopes. Only fall back to
+            # the manual authorize prompt if that also fails.
             pending_cmd = self._pending.pop(nonce, None) if nonce else None
             if pending_cmd == "AUTHENTICATE":
                 log.info("Authentication failed; clearing cached token")
                 self.tokens.clear()
                 self.authenticated = False
+                if not self._reauth_attempted and self.discord.connected:
+                    self._reauth_attempted = True
+                    log.info("Attempting silent re-authorization")
+                    reauth_nonce = await self.discord.authorize(
+                        self.client_id, OAUTH_SCOPES
+                    )
+                    self._pending[reauth_nonce] = "AUTHORIZE"
+                    return
                 # auth_error already implies "needs re-authorization"; the
                 # QML handler clears the saved token and flips the UI into
                 # the authorize-prompt state. Don't follow with
                 # auth_required, which would wipe the error message.
+                await self.server.send({"type": "auth_error", "error": message})
+                return
+
+            if pending_cmd == "AUTHORIZE":
+                # Failed authorize (silent or user-initiated): surface it as
+                # an auth error so the UI shows the authorize prompt and
+                # clears any stale saved token.
                 await self.server.send({"type": "auth_error", "error": message})
                 return
 
@@ -548,6 +616,7 @@ class DiscordBridge:
         elif cmd_name == "AUTHENTICATE":
             user = response_data.get("user", {})
             self.authenticated = True
+            self._reauth_attempted = False
             self.current_user = {
                 "id": user.get("id", ""),
                 "username": user.get("username", ""),
@@ -791,6 +860,9 @@ class DiscordBridge:
             if self._discord_task is None or self._discord_task.done():
                 self._discord_task = asyncio.create_task(self._discord_read_loop())
 
+            # A token minted from explicit user consent that still fails to
+            # authenticate is a real error; don't silently retry it.
+            self._reauth_attempted = True
             nonce = await self.discord.authorize(self.client_id, OAUTH_SCOPES)
             self._pending[nonce] = "AUTHORIZE"
 
@@ -825,19 +897,23 @@ class DiscordBridge:
         elif cmd == "shutdown":
             await self.shutdown()
 
-    async def _do_connect_flow(self, cached_token: str) -> None:
+    async def _do_connect_flow(self, cached_token: str, quiet: bool = False) -> None:
         """Full connection flow: connect, then try cached token or request auth.
 
         Idempotent: every client (daemon and each bar widget) sends `connect`
         when it attaches, so repeat calls while already connected or mid-auth
         must not tear down or duplicate anything.
+
+        `quiet` is used by the background reconnect loop: Discord-not-running
+        failures stay silent, and a missing token doesn't re-broadcast
+        `auth_required` (which the widget already shows).
         """
         if self.discord.connected:
             if self.authenticated or "AUTHENTICATE" in self._pending.values():
                 # Already connected (or auth in flight); new clients get
                 # state via the connection replay.
                 return
-        elif not await self._connect_discord():
+        elif not await self._connect_discord(quiet=quiet):
             return
 
         # Start reading from Discord in background (only one loop).
@@ -849,7 +925,7 @@ class DiscordBridge:
         if token:
             nonce = await self.discord.authenticate(token)
             self._pending[nonce] = "AUTHENTICATE"
-        else:
+        elif not quiet:
             await self.server.send({"type": "auth_required"})
 
 
