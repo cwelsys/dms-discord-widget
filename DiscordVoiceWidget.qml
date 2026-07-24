@@ -196,9 +196,7 @@ PluginComponent {
         switch (msg.type) {
         case "ready":
             bridgeReady = true
-            // Trigger connect flow with any cached token.
-            const token = pluginData.accessToken || ""
-            bridgeSocket.send({cmd: "connect", token: token})
+            bridgeSocket.send({cmd: "connect"})
             break
 
         case "auth_required":
@@ -209,18 +207,11 @@ PluginComponent {
         case "auth_complete":
             authenticated = true
             authError = ""
-            if (msg.access_token && pluginService) {
-                pluginService.savePluginData("discordVoice", "accessToken", msg.access_token)
-            }
             break
 
         case "auth_error":
             authError = msg.error || "Authentication failed"
             authenticated = false
-            // Clear bad cached token.
-            if (pluginService) {
-                pluginService.savePluginData("discordVoice", "accessToken", "")
-            }
             break
 
         case "voice_channel":
