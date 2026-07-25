@@ -850,7 +850,7 @@ class DiscordBridge:
         cmd = msg.get("cmd", "")
 
         if cmd == "connect":
-            asyncio.ensure_future(self._do_connect_flow(msg.get("token", "")))
+            asyncio.ensure_future(self._do_connect_flow())
 
         elif cmd == "authorize":
             if not self.discord.connected:
@@ -867,9 +867,7 @@ class DiscordBridge:
             self._pending[nonce] = "AUTHORIZE"
 
         elif cmd == "authenticate":
-            token = msg.get("token", "")
-            if not token:
-                token = self.tokens.load() or ""
+            token = self.tokens.load() or ""
             if not token:
                 await self.server.send({"type": "auth_required"})
                 return
@@ -897,7 +895,7 @@ class DiscordBridge:
         elif cmd == "shutdown":
             await self.shutdown()
 
-    async def _do_connect_flow(self, cached_token: str, quiet: bool = False) -> None:
+    async def _do_connect_flow(self, quiet: bool = False) -> None:
         """Full connection flow: connect, then try cached token or request auth.
 
         Idempotent: every client (daemon and each bar widget) sends `connect`
@@ -921,7 +919,7 @@ class DiscordBridge:
             self._discord_task = asyncio.create_task(self._discord_read_loop())
 
         # Try cached token.
-        token = cached_token or self.tokens.load()
+        token = self.tokens.load()
         if token:
             nonce = await self.discord.authenticate(token)
             self._pending[nonce] = "AUTHENTICATE"

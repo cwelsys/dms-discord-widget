@@ -115,23 +115,16 @@ Item {
     function handleBridgeMessage(msg) {
         switch (msg.type) {
         case "ready": {
-            const token = (pluginService && pluginService.loadPluginData(pluginId, "accessToken", "")) || ""
-            bridgeSocket.send({cmd: "connect", token: token})
+            bridgeSocket.send({cmd: "connect"})
             break
         }
 
         case "auth_complete":
             authenticated = true
-            if (msg.access_token && pluginService) {
-                pluginService.savePluginData(pluginId, "accessToken", msg.access_token)
-            }
             break
 
         case "auth_error":
             authenticated = false
-            if (pluginService) {
-                pluginService.savePluginData(pluginId, "accessToken", "")
-            }
             break
 
         case "auth_required":
