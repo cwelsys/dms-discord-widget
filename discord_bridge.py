@@ -440,9 +440,13 @@ class DiscordBridge:
             if not (self.tokens.access_token or self.tokens.load()):
                 continue
             try:
-                await self._do_connect_flow(self.tokens.access_token or "", quiet=True)
+                await self._do_connect_flow(quiet=True)
             except Exception as e:
-                log.debug("Background reconnect attempt failed: %s", e)
+                # Never downgrade this to debug: a silently swallowed
+                # exception here disables automatic re-authentication
+                # entirely, and the only symptom is the user having to click
+                # "Authorize" after every boot.
+                log.warning("Background reconnect attempt failed: %r", e)
 
     async def _on_client_connected(self, writer: asyncio.StreamWriter) -> None:
         """Replay current state to a client that connected after startup.
