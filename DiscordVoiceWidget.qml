@@ -145,6 +145,7 @@ PluginComponent {
         MouseArea {
             id: statusButtonArea
             anchors.fill: parent
+            visible: statusButton.interactive
             enabled: statusButton.interactive
             hoverEnabled: true
             cursorShape: Qt.PointingHandCursor
@@ -411,12 +412,15 @@ PluginComponent {
             }
 
             Repeater {
-                model: {
-                    if (!root.inVoice) return []
-                    const users = root.voiceUsers
-                    return users.length > root.maxBarAvatars
-                        ? users.slice(0, root.maxBarAvatars)
-                        : users
+                model: ScriptModel {
+                    objectProp: "id"
+                    values: {
+                        if (!root.inVoice) return []
+                        const users = root.voiceUsers
+                        return users.length > root.maxBarAvatars
+                            ? users.slice(0, root.maxBarAvatars)
+                            : users
+                    }
                 }
 
                 Item {
@@ -501,12 +505,15 @@ PluginComponent {
             }
 
             Repeater {
-                model: {
-                    if (!root.inVoice) return []
-                    const users = root.voiceUsers
-                    return users.length > root.maxBarAvatars
-                        ? users.slice(0, root.maxBarAvatars)
-                        : users
+                model: ScriptModel {
+                    objectProp: "id"
+                    values: {
+                        if (!root.inVoice) return []
+                        const users = root.voiceUsers
+                        return users.length > root.maxBarAvatars
+                            ? users.slice(0, root.maxBarAvatars)
+                            : users
+                    }
                 }
 
                 Item {
@@ -689,7 +696,7 @@ PluginComponent {
 
                             Timer {
                                 id: fillRelease
-                                interval: 250
+                                interval: 150
                                 onTriggered: pRow.showFill = false
                             }
 
@@ -852,7 +859,8 @@ PluginComponent {
                                     spacing: Theme.spacingXS
 
                                     StatusButton {
-                                        visible: !pRow.isSelf && pRow.displayVol !== 100
+                                        visible: !pRow.isSelf && !pRow.showFill
+                                                 && pRow.displayVol !== 100
                                         icon: "replay"
                                         interactive: true
                                         onActivated: root.sendUserVolume(modelData.id, 100)
