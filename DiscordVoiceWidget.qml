@@ -440,8 +440,12 @@ PluginComponent {
                             const isDeaf = modelData.self_deaf || modelData.deaf
                             const isSpeaking = root.speakingUsers[modelData.id] === true
 
-                            if (isDeaf || isMuted) return Theme.error
-                            if (isSpeaking) return Theme.success || "#4CAF50"
+                            // Deafened is checked first: a deafened user is
+                            // muted too, so the ring would otherwise always
+                            // read as plain mute.
+                            if (isDeaf) return Theme.warning
+                            if (isMuted) return Theme.error
+                            if (isSpeaking) return Theme.success
                             return "transparent"
                         }
 
@@ -459,24 +463,6 @@ PluginComponent {
                         imageSource: root.avatarUrl(modelData.id, modelData.avatar)
                         fallbackText: modelData.username ? modelData.username.charAt(0).toUpperCase() : "?"
                         fallbackIcon: ""
-                    }
-
-                    // Mute/deafen badge
-                    Rectangle {
-                        visible: modelData.self_mute || modelData.mute || modelData.self_deaf || modelData.deaf
-                        width: Math.max(10, root.widgetThickness * 0.35)
-                        height: width
-                        radius: width / 2
-                        color: Theme.error
-                        anchors.bottom: parent.bottom
-                        anchors.right: parent.right
-
-                        DankIcon {
-                            anchors.centerIn: parent
-                            name: (modelData.self_deaf || modelData.deaf) ? "headset_off" : "mic_off"
-                            size: parent.width - 2
-                            color: Theme.onError || "white"
-                        }
                     }
                 }
             }
@@ -531,8 +517,12 @@ PluginComponent {
                             const isDeaf = modelData.self_deaf || modelData.deaf
                             const isSpeaking = root.speakingUsers[modelData.id] === true
 
-                            if (isDeaf || isMuted) return Theme.error
-                            if (isSpeaking) return Theme.success || "#4CAF50"
+                            // Deafened is checked first: a deafened user is
+                            // muted too, so the ring would otherwise always
+                            // read as plain mute.
+                            if (isDeaf) return Theme.warning
+                            if (isMuted) return Theme.error
+                            if (isSpeaking) return Theme.success
                             return "transparent"
                         }
 
@@ -549,23 +539,6 @@ PluginComponent {
                         imageSource: root.avatarUrl(modelData.id, modelData.avatar)
                         fallbackText: modelData.username ? modelData.username.charAt(0).toUpperCase() : "?"
                         fallbackIcon: ""
-                    }
-
-                    Rectangle {
-                        visible: modelData.self_mute || modelData.mute || modelData.self_deaf || modelData.deaf
-                        width: Math.max(10, root.widgetThickness * 0.35)
-                        height: width
-                        radius: width / 2
-                        color: Theme.error
-                        anchors.bottom: parent.bottom
-                        anchors.right: parent.right
-
-                        DankIcon {
-                            anchors.centerIn: parent
-                            name: (modelData.self_deaf || modelData.deaf) ? "headset_off" : "mic_off"
-                            size: parent.width - 2
-                            color: Theme.onError || "white"
-                        }
                     }
                 }
             }
@@ -701,6 +674,7 @@ PluginComponent {
                             }
 
                             Rectangle {
+                                id: volFill
                                 anchors.left: parent.left
                                 anchors.top: parent.top
                                 anchors.bottom: parent.bottom
@@ -859,7 +833,10 @@ PluginComponent {
                                     spacing: Theme.spacingXS
 
                                     StatusButton {
-                                        visible: !pRow.isSelf && !pRow.showFill
+                                        // volFill.visible is opacity > 0, so it
+                                        // stays true until the fade has fully
+                                        // finished rather than when it starts.
+                                        visible: !pRow.isSelf && !volFill.visible
                                                  && pRow.displayVol !== 100
                                         icon: "replay"
                                         interactive: true
