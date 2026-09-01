@@ -610,7 +610,10 @@ PluginComponent {
 
                     // Participant list
                     Repeater {
-                        model: root.voiceUsers
+                        model: ScriptModel {
+                            objectProp: "id"
+                            values: root.voiceUsers
+                        }
 
                         Rectangle {
                             id: pRow
