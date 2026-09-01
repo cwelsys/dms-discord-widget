@@ -52,6 +52,47 @@ OP_PING = 3
 OP_PONG = 4
 
 
+def _voice_entry_fields(vs: dict[str, Any]) -> dict[str, Any]:
+    """Extract the fields we track from a raw RPC voice_state object.
+
+    Top-level `mute`/`volume` are the LOCAL (client-side) settings; the nested
+    `voice_state` holds the SERVER state (mute/deaf/suppress). Callers add the
+    transient `speaking` flag themselves.
+    """
+    user = vs.get("user", {})
+    voice = vs.get("voice_state", {})
+    return {
+        "id": user.get("id", ""),
+        "username": user.get("username", ""),
+        "avatar": user.get("avatar", ""),
+        "nick": vs.get("nick", "") or user.get("username", ""),
+        "mute": voice.get("mute", False),
+        "self_mute": voice.get("self_mute", False),
+        "deaf": voice.get("deaf", False),
+        "self_deaf": voice.get("self_deaf", False),
+        "suppress": voice.get("suppress", False),
+        "volume": vs.get("volume", 100),
+        "local_mute": vs.get("mute", False),
+    }
+
+
+def _user_voice_args(msg: dict[str, Any]) -> dict[str, Any] | None:
+    """Build clamped SET_USER_VOICE_SETTINGS args from a QML command.
+
+    Returns None if no user_id. Volume is hard-clamped to 0-200: Discord's RPC
+    rejects anything above 200 with ERROR 4000, failing the whole command.
+    """
+    uid = msg.get("user_id")
+    if not uid:
+        return None
+    args: dict[str, Any] = {"user_id": uid}
+    if "volume" in msg:
+        args["volume"] = max(0, min(200, int(msg["volume"])))
+    if "mute" in msg:
+        args["mute"] = bool(msg["mute"])
+    return args
+
+
 # ---------------------------------------------------------------------------
 # Discord IPC (binary-framed Unix socket)
 # ---------------------------------------------------------------------------
@@ -695,6 +736,18 @@ class DiscordBridge:
                 **self.voice_settings,
             })
 
+        elif cmd_name == "SET_USER_VOICE_SETTINGS":
+            # Discord does not emit VOICE_STATE_UPDATE for purely-local
+            # changes, so the echoed response is the only chance to refresh
+            # the cache and keep every connected popout in sync.
+            uid = response_data.get("user_id", "")
+            if uid and uid in self.voice_users:
+                if "volume" in response_data:
+                    self.voice_users[uid]["volume"] = response_data["volume"]
+                if "mute" in response_data:
+                    self.voice_users[uid]["local_mute"] = response_data["mute"]
+                await self._send_voice_state()
+
     async def _send_discord_command(
         self, cmd: str, args: dict[str, Any] | None = None
     ) -> None:
@@ -770,21 +823,9 @@ class DiscordBridge:
         # Parse initial voice states if provided.
         if channel_data and "voice_states" in channel_data:
             for vs in channel_data["voice_states"]:
-                user = vs.get("user", {})
-                voice = vs.get("voice_state", {})
-                uid = user.get("id", "")
-                if uid:
-                    self.voice_users[uid] = {
-                        "id": uid,
-                        "username": user.get("username", ""),
-                        "avatar": user.get("avatar", ""),
-                        "nick": vs.get("nick", "") or user.get("username", ""),
-                        "mute": voice.get("mute", False),
-                        "self_mute": voice.get("self_mute", False),
-                        "deaf": voice.get("deaf", False),
-                        "self_deaf": voice.get("self_deaf", False),
-                        "speaking": False,
-                    }
+                fields = _voice_entry_fields(vs)
+                if fields["id"]:
+                    self.voice_users[fields["id"]] = {**fields, "speaking": False}
             await self._send_voice_state()
 
         # Subscribe to this channel's events.
@@ -824,36 +865,17 @@ class DiscordBridge:
                 await self._on_voice_channel_leave()
 
         elif evt == "VOICE_STATE_CREATE":
-            user = data.get("user", {})
-            voice = data.get("voice_state", {})
-            uid = user.get("id", "")
-            if uid:
-                self.voice_users[uid] = {
-                    "id": uid,
-                    "username": user.get("username", ""),
-                    "avatar": user.get("avatar", ""),
-                    "nick": data.get("nick", "") or user.get("username", ""),
-                    "mute": voice.get("mute", False),
-                    "self_mute": voice.get("self_mute", False),
-                    "deaf": voice.get("deaf", False),
-                    "self_deaf": voice.get("self_deaf", False),
-                    "speaking": False,
-                }
+            fields = _voice_entry_fields(data)
+            if fields["id"]:
+                self.voice_users[fields["id"]] = {**fields, "speaking": False}
                 await self._send_voice_state()
 
         elif evt == "VOICE_STATE_UPDATE":
-            user = data.get("user", {})
-            voice = data.get("voice_state", {})
-            uid = user.get("id", "")
+            fields = _voice_entry_fields(data)
+            uid = fields["id"]
             if uid and uid in self.voice_users:
-                entry = self.voice_users[uid]
-                entry["username"] = user.get("username", entry["username"])
-                entry["avatar"] = user.get("avatar", entry["avatar"])
-                entry["nick"] = data.get("nick", "") or user.get("username", entry["username"])
-                entry["mute"] = voice.get("mute", entry["mute"])
-                entry["self_mute"] = voice.get("self_mute", entry["self_mute"])
-                entry["deaf"] = voice.get("deaf", entry["deaf"])
-                entry["self_deaf"] = voice.get("self_deaf", entry["self_deaf"])
+                prev_speaking = self.voice_users[uid].get("speaking", False)
+                self.voice_users[uid] = {**fields, "speaking": prev_speaking}
                 await self._send_voice_state()
 
         elif evt == "VOICE_STATE_DELETE":
@@ -929,6 +951,12 @@ class DiscordBridge:
                 args["deaf"] = msg["deaf"]
             if args:
                 await self._send_discord_command("SET_VOICE_SETTINGS", args)
+
+        elif cmd == "set_user_voice_settings":
+            user_args = _user_voice_args(msg)
+            if (self.authenticated and user_args
+                    and user_args["user_id"] != self.current_user.get("id")):
+                await self._send_discord_command("SET_USER_VOICE_SETTINGS", user_args)
 
         elif cmd == "get_voice_settings":
             if self.authenticated:
