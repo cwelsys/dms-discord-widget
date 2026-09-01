@@ -18,6 +18,7 @@ import signal
 import socket
 import struct
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -37,6 +38,11 @@ TOKEN_EXCHANGE_URL = "https://streamkit.discord.com/overlay/token"
 
 # How often the background loop retries reaching Discord while unauthenticated.
 RECONNECT_INTERVAL = 5.0
+
+# Minimum gap between unprompted AUTHORIZE attempts. Discord returns a code
+# without showing consent UI for an already-approved app, but a failing
+# authorize must not be retried every reconnect tick.
+SILENT_REAUTH_INTERVAL = 60.0
 
 # Discord IPC opcodes.
 OP_HANDSHAKE = 0
@@ -206,6 +212,13 @@ class TokenManager:
             cache_dir = os.path.join(xdg_cache, "DankMaterialShell")
         self._cache_path = os.path.join(cache_dir, "discord_token.json")
         self.access_token: str | None = None
+        self.consented = False
+
+    def _write(self, data: dict[str, Any]) -> None:
+        os.makedirs(os.path.dirname(self._cache_path), exist_ok=True)
+        fd = os.open(self._cache_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
 
     def load(self) -> str | None:
         """Load cached access token from disk."""
@@ -215,6 +228,11 @@ class TokenManager:
             with open(self._cache_path) as f:
                 data = json.load(f)
                 self.access_token = data.get("access_token")
+                # Caches written before consent was tracked only exist because
+                # the user approved the app, so a stored token implies consent.
+                self.consented = bool(
+                    data.get("consented", self.access_token is not None)
+                )
                 return self.access_token
         except (FileNotFoundError, json.JSONDecodeError, KeyError):
             return None
@@ -222,14 +240,20 @@ class TokenManager:
     def save(self, token: str) -> None:
         """Save access token to disk (owner-readable only)."""
         self.access_token = token
-        os.makedirs(os.path.dirname(self._cache_path), exist_ok=True)
-        fd = os.open(self._cache_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            json.dump({"access_token": token}, f)
+        self.consented = True
+        self._write({"access_token": token, "consented": True})
 
     def clear(self) -> None:
-        """Remove cached token."""
+        """Drop the cached token, preserving the record of prior consent.
+
+        Consent outlives any single token: re-authorizing an already-approved
+        app needs no user interaction, so forgetting it here is what forces a
+        manual click after an expired token.
+        """
         self.access_token = None
+        if self.consented:
+            self._write({"consented": True})
+            return
         try:
             os.unlink(self._cache_path)
         except FileNotFoundError:
@@ -385,7 +409,7 @@ class DiscordBridge:
         self.voice_users: dict[str, dict[str, Any]] = {}
         self.voice_settings: dict[str, Any] = {"mute": False, "deaf": False}
         self._pending: dict[str, str] = {}  # nonce -> command name
-        self._reauth_attempted = False
+        self._last_silent_reauth = 0.0
         self._shutdown = False
         self._discord_task: asyncio.Task[None] | None = None
 
@@ -437,7 +461,9 @@ class DiscordBridge:
             if "AUTHENTICATE" in pending or "AUTHORIZE" in pending:
                 continue
             # No prior consent means we can't authenticate silently.
-            if not (self.tokens.access_token or self.tokens.load()):
+            if self.tokens.access_token is None:
+                self.tokens.load()
+            if not (self.tokens.access_token or self.tokens.consented):
                 continue
             try:
                 await self._do_connect_flow(quiet=True)
@@ -447,6 +473,19 @@ class DiscordBridge:
                 # entirely, and the only symptom is the user having to click
                 # "Authorize" after every boot.
                 log.warning("Background reconnect attempt failed: %r", e)
+
+    def _may_silently_reauth(self) -> bool:
+        """True if an unprompted AUTHORIZE is allowed right now.
+
+        Rate limited rather than latched: a single failed attempt must not
+        disable automatic re-authorization for the life of the process, which
+        is what leaves the user clicking "Authorize" by hand.
+        """
+        now = time.monotonic()
+        if now - self._last_silent_reauth < SILENT_REAUTH_INTERVAL:
+            return False
+        self._last_silent_reauth = now
+        return True
 
     async def _on_client_connected(self, writer: asyncio.StreamWriter) -> None:
         """Replay current state to a client that connected after startup.
@@ -560,8 +599,7 @@ class DiscordBridge:
                 log.info("Authentication failed; clearing cached token")
                 self.tokens.clear()
                 self.authenticated = False
-                if not self._reauth_attempted and self.discord.connected:
-                    self._reauth_attempted = True
+                if self.discord.connected and self._may_silently_reauth():
                     log.info("Attempting silent re-authorization")
                     reauth_nonce = await self.discord.authorize(
                         self.client_id, OAUTH_SCOPES
@@ -620,7 +658,7 @@ class DiscordBridge:
         elif cmd_name == "AUTHENTICATE":
             user = response_data.get("user", {})
             self.authenticated = True
-            self._reauth_attempted = False
+            self._last_silent_reauth = 0.0
             self.current_user = {
                 "id": user.get("id", ""),
                 "username": user.get("username", ""),
@@ -866,7 +904,7 @@ class DiscordBridge:
 
             # A token minted from explicit user consent that still fails to
             # authenticate is a real error; don't silently retry it.
-            self._reauth_attempted = True
+            self._last_silent_reauth = time.monotonic()
             nonce = await self.discord.authorize(self.client_id, OAUTH_SCOPES)
             self._pending[nonce] = "AUTHORIZE"
 
@@ -922,12 +960,16 @@ class DiscordBridge:
         if self._discord_task is None or self._discord_task.done():
             self._discord_task = asyncio.create_task(self._discord_read_loop())
 
-        # Try cached token.
+        # Try cached token, then fall back to re-authorizing on prior consent.
         token = self.tokens.load()
         if token:
             nonce = await self.discord.authenticate(token)
             self._pending[nonce] = "AUTHENTICATE"
-        elif not quiet:
+        elif self.tokens.consented and self._may_silently_reauth():
+            log.info("No cached token but prior consent recorded; re-authorizing")
+            nonce = await self.discord.authorize(self.client_id, OAUTH_SCOPES)
+            self._pending[nonce] = "AUTHORIZE"
+        elif not quiet and not self.tokens.consented:
             await self.server.send({"type": "auth_required"})
 
 
