@@ -16,6 +16,7 @@ PluginComponent {
     // --- Bridge state ---
     property bool bridgeReady: false
     property bool authenticated: false
+    property bool authRequired: false
     property string authError: ""
     property string selfId: ""
 
@@ -42,6 +43,13 @@ PluginComponent {
     readonly property bool inVoice: currentChannel !== null && currentChannel !== undefined
     readonly property bool isMuted: voiceSettings.mute || false
     readonly property bool isDeafened: voiceSettings.deaf || false
+
+    // Only true when the user actually has to do something. Merely being
+    // unauthenticated is the normal state for the second or so between the
+    // bridge starting and its token round-trip landing, and the bridge
+    // re-authorizes silently after an expiry, so keying the UI off
+    // !authenticated flashed the authorize prompt on every shell restart.
+    readonly property bool needsAuth: authRequired || authError !== ""
 
     // --- Socket path ---
     readonly property string bridgeSocketPath: {
@@ -104,12 +112,53 @@ PluginComponent {
         root.sendBridgeCommand({cmd: "set_user_voice_settings", user_id: uid, mute: muted})
     }
 
+    // Every slot in a participant row's status cluster is one of these, so the
+    // columns line up down the list whether the icon is a control or a
+    // read-only indicator.
+    component StatusButton: Rectangle {
+        id: statusButton
+
+        property alias icon: statusButtonIcon.name
+        property color iconColor: Theme.surfaceVariantText
+        property bool interactive: false
+
+        signal activated
+
+        width: 28
+        height: 28
+        radius: Theme.cornerRadius
+        color: interactive && statusButtonArea.containsMouse
+               ? Theme.primaryHover : "transparent"
+
+        DankRipple {
+            id: statusButtonRipple
+            cornerRadius: statusButton.radius
+        }
+
+        DankIcon {
+            id: statusButtonIcon
+            anchors.centerIn: parent
+            size: 18
+            color: statusButton.iconColor
+        }
+
+        MouseArea {
+            id: statusButtonArea
+            anchors.fill: parent
+            enabled: statusButton.interactive
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onPressed: (mouse) => statusButtonRipple.trigger(mouse.x, mouse.y)
+            onClicked: statusButton.activated()
+        }
+    }
+
     // --- Visibility ---
-    // Show the pill when in a voice call (participants), or when not
-    // authenticated (login placeholder so the popout is reachable).
-    // Hide only in the steady state: authenticated + idle.
+    // Show the pill when in a voice call (participants), or when authorization
+    // genuinely needs the user (so the popout is reachable to fix it). Hide
+    // while connecting or re-authorizing: those resolve on their own.
     function updateVisibility() {
-        if (inVoice || !authenticated) {
+        if (inVoice || needsAuth) {
             clearVisibilityOverride()
         } else {
             setVisibilityOverride(false)
@@ -118,7 +167,7 @@ PluginComponent {
 
     Component.onCompleted: updateVisibility()
     onInVoiceChanged: updateVisibility()
-    onAuthenticatedChanged: updateVisibility()
+    onNeedsAuthChanged: updateVisibility()
 
     // =====================================================================
     // Bridge process
@@ -235,11 +284,13 @@ PluginComponent {
 
         case "auth_required":
             authenticated = false
+            authRequired = true
             authError = ""
             break
 
         case "auth_complete":
             authenticated = true
+            authRequired = false
             authError = ""
             if (msg.user && msg.user.id) selfId = msg.user.id
             break
@@ -352,7 +403,7 @@ PluginComponent {
             spacing: -4
 
             DankIcon {
-                visible: !root.authenticated
+                visible: root.needsAuth
                 anchors.verticalCenter: parent.verticalCenter
                 name: "headset_mic"
                 size: Math.min(root.widgetThickness, 18)
@@ -442,7 +493,7 @@ PluginComponent {
             spacing: -4
 
             DankIcon {
-                visible: !root.authenticated
+                visible: root.needsAuth
                 anchors.horizontalCenter: parent.horizontalCenter
                 name: "headset_mic"
                 size: Math.min(root.widgetThickness, 18)
@@ -542,7 +593,7 @@ PluginComponent {
 
                 // --- Not authenticated ---
                 Column {
-                    visible: !root.authenticated
+                    visible: root.needsAuth
                     width: parent.width
                     spacing: Theme.spacingM
 
@@ -638,7 +689,7 @@ PluginComponent {
 
                             Timer {
                                 id: fillRelease
-                                interval: 600
+                                interval: 250
                                 onTriggered: pRow.showFill = false
                             }
 
@@ -653,7 +704,7 @@ PluginComponent {
                                 visible: opacity > 0
 
                                 Behavior on opacity {
-                                    NumberAnimation { duration: Theme.mediumDuration }
+                                    NumberAnimation { duration: Theme.shortDuration }
                                 }
                             }
 
@@ -667,7 +718,7 @@ PluginComponent {
                                 visible: opacity > 0
 
                                 Behavior on opacity {
-                                    NumberAnimation { duration: Theme.mediumDuration }
+                                    NumberAnimation { duration: Theme.shortDuration }
                                 }
                             }
 
@@ -733,7 +784,7 @@ PluginComponent {
 
                                     Timer {
                                         id: hoverRelease
-                                        interval: 450
+                                        interval: 250
                                         onTriggered: avatarSlot.hovering = false
                                     }
 
@@ -798,20 +849,13 @@ PluginComponent {
                                 Row {
                                     id: statusRow
                                     anchors.verticalCenter: parent.verticalCenter
-                                    spacing: 2
+                                    spacing: Theme.spacingXS
 
-                                    DankIcon {
+                                    StatusButton {
                                         visible: !pRow.isSelf && pRow.displayVol !== 100
-                                        name: "replay"
-                                        size: 16
-                                        color: Theme.surfaceVariantText
-                                        anchors.verticalCenter: parent.verticalCenter
-
-                                        MouseArea {
-                                            anchors.fill: parent
-                                            cursorShape: Qt.PointingHandCursor
-                                            onClicked: root.sendUserVolume(modelData.id, 100)
-                                        }
+                                        icon: "replay"
+                                        interactive: true
+                                        onActivated: root.sendUserVolume(modelData.id, 100)
                                     }
                                     StyledText {
                                         visible: !pRow.isSelf
@@ -820,42 +864,29 @@ PluginComponent {
                                         color: Theme.surfaceVariantText
                                         anchors.verticalCenter: parent.verticalCenter
                                     }
-                                    DankIcon {
+                                    StatusButton {
                                         visible: pRow.isSelf || pRow.micOff
-                                        name: pRow.micOff ? "mic_off" : "mic"
-                                        size: 16
-                                        color: pRow.micOff ? Theme.error : Theme.surfaceVariantText
-
-                                        MouseArea {
-                                            anchors.fill: parent
-                                            enabled: pRow.isSelf
-                                            cursorShape: Qt.PointingHandCursor
-                                            onClicked: root.sendBridgeCommand({cmd: "set_voice_settings",
-                                                                               mute: !root.isMuted})
-                                        }
+                                        icon: pRow.micOff ? "mic_off" : "mic"
+                                        iconColor: pRow.micOff ? Theme.error : Theme.surfaceVariantText
+                                        interactive: pRow.isSelf
+                                        onActivated: root.sendBridgeCommand({cmd: "set_voice_settings",
+                                                                             mute: !root.isMuted})
                                     }
-                                    DankIcon {
+                                    StatusButton {
                                         visible: pRow.isSelf || pRow.headOff
-                                        name: pRow.headOff ? "headset_off" : "headset"
-                                        size: 16
-                                        color: pRow.headOff ? Theme.error : Theme.surfaceVariantText
-
-                                        MouseArea {
-                                            anchors.fill: parent
-                                            enabled: pRow.isSelf
-                                            cursorShape: Qt.PointingHandCursor
-                                            onClicked: root.sendBridgeCommand({cmd: "set_voice_settings",
-                                                                               deaf: !root.isDeafened})
-                                        }
+                                        icon: pRow.headOff ? "headset_off" : "headset"
+                                        iconColor: pRow.headOff ? Theme.error : Theme.surfaceVariantText
+                                        interactive: pRow.isSelf
+                                        onActivated: root.sendBridgeCommand({cmd: "set_voice_settings",
+                                                                             deaf: !root.isDeafened})
                                     }
                                     // Same glyph Discord uses, tinted amber to
                                     // separate "no permission to speak here"
                                     // from the red self/server mute.
-                                    DankIcon {
+                                    StatusButton {
                                         visible: modelData.suppress === true && !pRow.micOff
-                                        name: "mic_off"
-                                        size: 16
-                                        color: Theme.warning
+                                        icon: "mic_off"
+                                        iconColor: Theme.warning
                                     }
                                 }
                             }
@@ -865,7 +896,7 @@ PluginComponent {
 
                 // --- Authenticated, not in voice ---
                 Column {
-                    visible: root.authenticated && !root.inVoice
+                    visible: !root.needsAuth && !root.inVoice
                     width: parent.width
                     spacing: Theme.spacingS
 
