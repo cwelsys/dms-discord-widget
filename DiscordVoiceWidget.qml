@@ -17,6 +17,7 @@ PluginComponent {
     property bool bridgeReady: false
     property bool authenticated: false
     property string authError: ""
+    property string selfId: ""
 
     // --- Voice state ---
     property var currentChannel: null
@@ -68,6 +69,39 @@ PluginComponent {
     function sendBridgeCommand(cmd) {
         console.warn("DiscordVoice: sendBridgeCommand", redactForLog(cmd))
         bridgeSocket.send(cmd)
+    }
+
+    // A drag emits a move event per pixel; sending each one would flood the
+    // bridge and Discord's rate limiter. Coalesce to the latest value per
+    // user and flush on a timer, with a guaranteed final send on release so
+    // the value the user let go on is always the one that lands.
+    property var _pendingVol: ({})
+
+    Timer {
+        id: volThrottle
+        interval: 80
+        repeat: false
+        onTriggered: {
+            for (var uid in root._pendingVol)
+                root.sendBridgeCommand({cmd: "set_user_voice_settings",
+                                        user_id: uid, volume: root._pendingVol[uid]})
+            root._pendingVol = {}
+        }
+    }
+
+    function queueUserVolume(uid, v) {
+        root._pendingVol[uid] = v
+        if (!volThrottle.running) volThrottle.start()
+    }
+
+    function sendUserVolume(uid, v) {
+        volThrottle.stop()
+        root._pendingVol = {}
+        root.sendBridgeCommand({cmd: "set_user_voice_settings", user_id: uid, volume: v})
+    }
+
+    function setUserMute(uid, muted) {
+        root.sendBridgeCommand({cmd: "set_user_voice_settings", user_id: uid, mute: muted})
     }
 
     // --- Visibility ---
@@ -207,6 +241,7 @@ PluginComponent {
         case "auth_complete":
             authenticated = true
             authError = ""
+            if (msg.user && msg.user.id) selfId = msg.user.id
             break
 
         case "auth_error":
@@ -578,10 +613,71 @@ PluginComponent {
                         model: root.voiceUsers
 
                         Rectangle {
+                            id: pRow
+
+                            property bool isSelf: modelData.id === root.selfId
+                            property bool dragging: false
+                            property int dragVol: 100
+                            readonly property int displayVol:
+                                dragging ? dragVol
+                                         : (modelData.volume === undefined ? 100 : modelData.volume)
+
                             width: parent.width
                             height: 44
                             radius: Theme.cornerRadius
                             color: Theme.surfaceContainerHigh
+                            clip: true
+
+                            Rectangle {
+                                visible: !pRow.isSelf && pRow.dragging
+                                anchors.left: parent.left
+                                anchors.top: parent.top
+                                anchors.bottom: parent.bottom
+                                width: parent.width * (pRow.displayVol / 200)
+                                radius: Theme.cornerRadius
+                                color: "#404CAF50"
+                            }
+
+                            Rectangle {
+                                visible: !pRow.isSelf && pRow.dragging
+                                width: 1
+                                anchors.top: parent.top
+                                anchors.bottom: parent.bottom
+                                x: parent.width * 0.5
+                                color: Theme.surfaceVariantText
+                            }
+
+                            // Declared before the content Row on purpose: the
+                            // mute and reset icons carry their own MouseAreas
+                            // and must layer above this one to win their hit
+                            // regions. preventStealing keeps the popout's
+                            // Flickable from grabbing the horizontal drag.
+                            MouseArea {
+                                id: dragArea
+                                anchors.fill: parent
+                                enabled: !pRow.isSelf
+                                preventStealing: true
+                                property real startX: 0
+                                onPressed: (mouse) => { startX = mouse.x }
+                                onPositionChanged: (mouse) => {
+                                    if (!pRow.dragging && Math.abs(mouse.x - startX) > 4)
+                                        pRow.dragging = true
+                                    if (pRow.dragging) {
+                                        var frac = Math.max(0, Math.min(1, mouse.x / pRow.width))
+                                        var v = Math.round(frac * 200)
+                                        if (Math.abs(v - 100) <= 6) v = 100
+                                        pRow.dragVol = v
+                                        root.queueUserVolume(modelData.id, v)
+                                    }
+                                }
+                                onReleased: {
+                                    if (pRow.dragging) {
+                                        root.sendUserVolume(modelData.id, pRow.dragVol)
+                                        pRow.dragging = false
+                                    }
+                                }
+                                onCanceled: pRow.dragging = false
+                            }
 
                             Row {
                                 anchors.fill: parent
@@ -613,6 +709,13 @@ PluginComponent {
                                     anchors.verticalCenter: parent.verticalCenter
                                     spacing: 2
 
+                                    StyledText {
+                                        visible: !pRow.isSelf
+                                        text: pRow.displayVol + "%"
+                                        font.pixelSize: Theme.fontSizeSmall
+                                        color: Theme.surfaceVariantText
+                                        anchors.verticalCenter: parent.verticalCenter
+                                    }
                                     DankIcon {
                                         visible: modelData.self_mute || modelData.mute
                                         name: "mic_off"
@@ -624,6 +727,42 @@ PluginComponent {
                                         name: "headset_off"
                                         size: 16
                                         color: Theme.error
+                                    }
+                                    // Same glyph Discord uses, tinted amber to
+                                    // separate "no permission to speak here"
+                                    // from the red self/server mute.
+                                    DankIcon {
+                                        visible: modelData.suppress === true
+                                                 && !(modelData.self_mute || modelData.mute)
+                                        name: "mic_off"
+                                        size: 16
+                                        color: Theme.warning ? Theme.warning : "#FFA000"
+                                    }
+                                    DankIcon {
+                                        visible: !pRow.isSelf && pRow.displayVol !== 100
+                                        name: "replay"
+                                        size: 16
+                                        color: Theme.surfaceVariantText
+                                        anchors.verticalCenter: parent.verticalCenter
+
+                                        MouseArea {
+                                            anchors.fill: parent
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: root.sendUserVolume(modelData.id, 100)
+                                        }
+                                    }
+                                    DankIcon {
+                                        visible: !pRow.isSelf
+                                        name: modelData.local_mute ? "volume_off" : "volume_up"
+                                        size: 16
+                                        color: modelData.local_mute ? Theme.error : Theme.surfaceVariantText
+                                        anchors.verticalCenter: parent.verticalCenter
+
+                                        MouseArea {
+                                            anchors.fill: parent
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: root.setUserMute(modelData.id, !modelData.local_mute)
+                                        }
                                     }
                                 }
                             }
