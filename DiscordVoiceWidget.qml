@@ -534,7 +534,7 @@ PluginComponent {
             id: popout
 
             headerText: root.inVoice ? (root.currentChannel ? root.currentChannel.name : "Voice Channel") : "Discord Call Overlay"
-            showCloseButton: true
+            showCloseButton: false
 
             Column {
                 width: parent.width
@@ -684,15 +684,54 @@ PluginComponent {
                                 anchors.margins: Theme.spacingS
                                 spacing: Theme.spacingS
 
-                                DankCircularImage {
+                                // Hovering another participant's avatar reveals
+                                // their local-mute toggle: the same slot
+                                // overlay the volumeMixer plugin uses for
+                                // reset-to-100%. Staying visible while muted
+                                // keeps the state readable without a hover.
+                                Item {
+                                    id: avatarSlot
                                     width: 32
                                     height: 32
                                     anchors.verticalCenter: parent.verticalCenter
-                                    imageSource: root.avatarUrl(modelData.id, modelData.avatar)
-                                    fallbackText: modelData.username ? modelData.username.charAt(0).toUpperCase() : "?"
-                                    fallbackIcon: ""
-                                    border.width: root.speakingUsers[modelData.id] === true ? 2 : 0
-                                    border.color: Theme.success || "#4CAF50"
+
+                                    readonly property bool showMute:
+                                        !pRow.isSelf
+                                        && (muteArea.containsMouse || modelData.local_mute === true)
+
+                                    DankCircularImage {
+                                        anchors.fill: parent
+                                        imageSource: root.avatarUrl(modelData.id, modelData.avatar)
+                                        fallbackText: modelData.username ? modelData.username.charAt(0).toUpperCase() : "?"
+                                        fallbackIcon: ""
+                                        border.width: root.speakingUsers[modelData.id] === true ? 2 : 0
+                                        border.color: Theme.success || "#4CAF50"
+                                        opacity: avatarSlot.showMute ? 0.15 : 1.0
+                                    }
+
+                                    Rectangle {
+                                        anchors.fill: parent
+                                        radius: width / 2
+                                        visible: avatarSlot.showMute
+                                        color: Theme.withAlpha(Theme.surfaceContainerHighest, 0.85)
+
+                                        DankIcon {
+                                            anchors.centerIn: parent
+                                            name: modelData.local_mute ? "volume_off" : "volume_up"
+                                            size: 18
+                                            color: modelData.local_mute ? Theme.error : Theme.primary
+                                        }
+                                    }
+
+                                    MouseArea {
+                                        id: muteArea
+                                        anchors.fill: parent
+                                        anchors.margins: -Theme.spacingXS
+                                        enabled: !pRow.isSelf
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: root.setUserMute(modelData.id, !modelData.local_mute)
+                                    }
                                 }
 
                                 StyledText {
@@ -736,7 +775,7 @@ PluginComponent {
                                                  && !(modelData.self_mute || modelData.mute)
                                         name: "mic_off"
                                         size: 16
-                                        color: Theme.warning ? Theme.warning : "#FFA000"
+                                        color: Theme.warning
                                     }
                                     DankIcon {
                                         visible: !pRow.isSelf && pRow.displayVol !== 100
@@ -749,19 +788,6 @@ PluginComponent {
                                             anchors.fill: parent
                                             cursorShape: Qt.PointingHandCursor
                                             onClicked: root.sendUserVolume(modelData.id, 100)
-                                        }
-                                    }
-                                    DankIcon {
-                                        visible: !pRow.isSelf
-                                        name: modelData.local_mute ? "volume_off" : "volume_up"
-                                        size: 16
-                                        color: modelData.local_mute ? Theme.error : Theme.surfaceVariantText
-                                        anchors.verticalCenter: parent.verticalCenter
-
-                                        MouseArea {
-                                            anchors.fill: parent
-                                            cursorShape: Qt.PointingHandCursor
-                                            onClicked: root.setUserMute(modelData.id, !modelData.local_mute)
                                         }
                                     }
                                 }
