@@ -631,6 +631,12 @@ PluginComponent {
                             color: Theme.surfaceContainerHigh
                             clip: true
 
+                            TextMetrics {
+                                id: volMetrics
+                                font.pixelSize: Theme.fontSizeSmall
+                                text: "200%"
+                            }
+
                             Rectangle {
                                 visible: !pRow.isSelf && pRow.dragging
                                 anchors.left: parent.left
@@ -638,7 +644,7 @@ PluginComponent {
                                 anchors.bottom: parent.bottom
                                 width: parent.width * (pRow.displayVol / 200)
                                 radius: Theme.cornerRadius
-                                color: "#404CAF50"
+                                color: Theme.withAlpha(Theme.success, 0.25)
                             }
 
                             Rectangle {
@@ -647,7 +653,7 @@ PluginComponent {
                                 anchors.top: parent.top
                                 anchors.bottom: parent.bottom
                                 x: parent.width * 0.5
-                                color: Theme.surfaceVariantText
+                                color: Theme.outlineMedium
                             }
 
                             // Declared before the content Row on purpose: the
@@ -698,9 +704,16 @@ PluginComponent {
                                     height: 32
                                     anchors.verticalCenter: parent.verticalCenter
 
+                                    property bool hovering: false
                                     readonly property bool showMute:
                                         !pRow.isSelf
-                                        && (muteArea.containsMouse || modelData.local_mute === true)
+                                        && (hovering || modelData.local_mute === true)
+
+                                    Timer {
+                                        id: hoverRelease
+                                        interval: 450
+                                        onTriggered: avatarSlot.hovering = false
+                                    }
 
                                     DankCircularImage {
                                         anchors.fill: parent
@@ -708,15 +721,24 @@ PluginComponent {
                                         fallbackText: modelData.username ? modelData.username.charAt(0).toUpperCase() : "?"
                                         fallbackIcon: ""
                                         border.width: root.speakingUsers[modelData.id] === true ? 2 : 0
-                                        border.color: Theme.success || "#4CAF50"
+                                        border.color: Theme.success
                                         opacity: avatarSlot.showMute ? 0.15 : 1.0
+
+                                        Behavior on opacity {
+                                            NumberAnimation { duration: Theme.shortDuration }
+                                        }
                                     }
 
                                     Rectangle {
                                         anchors.fill: parent
                                         radius: width / 2
-                                        visible: avatarSlot.showMute
+                                        opacity: avatarSlot.showMute ? 1.0 : 0.0
+                                        visible: opacity > 0
                                         color: Theme.withAlpha(Theme.surfaceContainerHighest, 0.85)
+
+                                        Behavior on opacity {
+                                            NumberAnimation { duration: Theme.shortDuration }
+                                        }
 
                                         DankIcon {
                                             anchors.centerIn: parent
@@ -733,6 +755,11 @@ PluginComponent {
                                         enabled: !pRow.isSelf
                                         hoverEnabled: true
                                         cursorShape: Qt.PointingHandCursor
+                                        onEntered: {
+                                            hoverRelease.stop()
+                                            avatarSlot.hovering = true
+                                        }
+                                        onExited: hoverRelease.restart()
                                         onClicked: root.setUserMute(modelData.id, !modelData.local_mute)
                                     }
                                 }
@@ -756,6 +783,8 @@ PluginComponent {
                                         text: pRow.displayVol + "%"
                                         font.pixelSize: Theme.fontSizeSmall
                                         color: Theme.surfaceVariantText
+                                        width: volMetrics.width
+                                        horizontalAlignment: Text.AlignRight
                                         anchors.verticalCenter: parent.verticalCenter
                                     }
                                     DankIcon {
@@ -781,14 +810,20 @@ PluginComponent {
                                         color: Theme.warning
                                     }
                                     DankIcon {
-                                        visible: !pRow.isSelf && pRow.displayVol !== 100
+                                        visible: !pRow.isSelf
+                                        opacity: pRow.displayVol !== 100 ? 1.0 : 0.0
                                         name: "replay"
                                         size: 16
                                         color: Theme.surfaceVariantText
                                         anchors.verticalCenter: parent.verticalCenter
 
+                                        Behavior on opacity {
+                                            NumberAnimation { duration: Theme.shortDuration }
+                                        }
+
                                         MouseArea {
                                             anchors.fill: parent
+                                            enabled: pRow.displayVol !== 100
                                             cursorShape: Qt.PointingHandCursor
                                             onClicked: root.sendUserVolume(modelData.id, 100)
                                         }
