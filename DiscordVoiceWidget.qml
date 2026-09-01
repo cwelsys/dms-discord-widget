@@ -620,10 +620,15 @@ PluginComponent {
 
                             property bool isSelf: modelData.id === root.selfId
                             property bool dragging: false
+                            property bool showFill: false
                             property int dragVol: 100
                             readonly property int displayVol:
                                 dragging ? dragVol
                                          : (modelData.volume === undefined ? 100 : modelData.volume)
+                            readonly property bool micOff:
+                                isSelf ? root.isMuted : (modelData.self_mute || modelData.mute)
+                            readonly property bool headOff:
+                                isSelf ? root.isDeafened : (modelData.self_deaf || modelData.deaf)
 
                             width: parent.width
                             height: 44
@@ -631,29 +636,39 @@ PluginComponent {
                             color: Theme.surfaceContainerHigh
                             clip: true
 
-                            TextMetrics {
-                                id: volMetrics
-                                font.pixelSize: Theme.fontSizeSmall
-                                text: "200%"
+                            Timer {
+                                id: fillRelease
+                                interval: 600
+                                onTriggered: pRow.showFill = false
                             }
 
                             Rectangle {
-                                visible: !pRow.isSelf && pRow.dragging
                                 anchors.left: parent.left
                                 anchors.top: parent.top
                                 anchors.bottom: parent.bottom
                                 width: parent.width * (pRow.displayVol / 200)
                                 radius: Theme.cornerRadius
                                 color: Theme.withAlpha(Theme.success, 0.25)
+                                opacity: pRow.showFill ? 1.0 : 0.0
+                                visible: opacity > 0
+
+                                Behavior on opacity {
+                                    NumberAnimation { duration: Theme.mediumDuration }
+                                }
                             }
 
                             Rectangle {
-                                visible: !pRow.isSelf && pRow.dragging
                                 width: 1
                                 anchors.top: parent.top
                                 anchors.bottom: parent.bottom
                                 x: parent.width * 0.5
                                 color: Theme.outlineMedium
+                                opacity: pRow.showFill ? 1.0 : 0.0
+                                visible: opacity > 0
+
+                                Behavior on opacity {
+                                    NumberAnimation { duration: Theme.mediumDuration }
+                                }
                             }
 
                             // Declared before the content Row on purpose: the
@@ -669,8 +684,11 @@ PluginComponent {
                                 property real startX: 0
                                 onPressed: (mouse) => { startX = mouse.x }
                                 onPositionChanged: (mouse) => {
-                                    if (!pRow.dragging && Math.abs(mouse.x - startX) > 4)
+                                    if (!pRow.dragging && Math.abs(mouse.x - startX) > 4) {
+                                        fillRelease.stop()
+                                        pRow.showFill = true
                                         pRow.dragging = true
+                                    }
                                     if (pRow.dragging) {
                                         var frac = Math.max(0, Math.min(1, mouse.x / pRow.width))
                                         var v = Math.round(frac * 200)
@@ -683,9 +701,13 @@ PluginComponent {
                                     if (pRow.dragging) {
                                         root.sendUserVolume(modelData.id, pRow.dragVol)
                                         pRow.dragging = false
+                                        fillRelease.restart()
                                     }
                                 }
-                                onCanceled: pRow.dragging = false
+                                onCanceled: {
+                                    pRow.dragging = false
+                                    fillRelease.restart()
+                                }
                             }
 
                             Row {
@@ -778,126 +800,64 @@ PluginComponent {
                                     anchors.verticalCenter: parent.verticalCenter
                                     spacing: 2
 
-                                    StyledText {
-                                        visible: !pRow.isSelf
-                                        text: pRow.displayVol + "%"
-                                        font.pixelSize: Theme.fontSizeSmall
-                                        color: Theme.surfaceVariantText
-                                        width: volMetrics.width
-                                        horizontalAlignment: Text.AlignRight
-                                        anchors.verticalCenter: parent.verticalCenter
-                                    }
                                     DankIcon {
-                                        visible: modelData.self_mute || modelData.mute
-                                        name: "mic_off"
-                                        size: 16
-                                        color: Theme.error
-                                    }
-                                    DankIcon {
-                                        visible: modelData.self_deaf || modelData.deaf
-                                        name: "headset_off"
-                                        size: 16
-                                        color: Theme.error
-                                    }
-                                    // Same glyph Discord uses, tinted amber to
-                                    // separate "no permission to speak here"
-                                    // from the red self/server mute.
-                                    DankIcon {
-                                        visible: modelData.suppress === true
-                                                 && !(modelData.self_mute || modelData.mute)
-                                        name: "mic_off"
-                                        size: 16
-                                        color: Theme.warning
-                                    }
-                                    DankIcon {
-                                        visible: !pRow.isSelf
-                                        opacity: pRow.displayVol !== 100 ? 1.0 : 0.0
+                                        visible: !pRow.isSelf && pRow.displayVol !== 100
                                         name: "replay"
                                         size: 16
                                         color: Theme.surfaceVariantText
                                         anchors.verticalCenter: parent.verticalCenter
 
-                                        Behavior on opacity {
-                                            NumberAnimation { duration: Theme.shortDuration }
-                                        }
-
                                         MouseArea {
                                             anchors.fill: parent
-                                            enabled: pRow.displayVol !== 100
                                             cursorShape: Qt.PointingHandCursor
                                             onClicked: root.sendUserVolume(modelData.id, 100)
                                         }
                                     }
+                                    StyledText {
+                                        visible: !pRow.isSelf
+                                        text: pRow.displayVol + "%"
+                                        font.pixelSize: Theme.fontSizeSmall
+                                        color: Theme.surfaceVariantText
+                                        anchors.verticalCenter: parent.verticalCenter
+                                    }
+                                    DankIcon {
+                                        visible: pRow.isSelf || pRow.micOff
+                                        name: pRow.micOff ? "mic_off" : "mic"
+                                        size: 16
+                                        color: pRow.micOff ? Theme.error : Theme.surfaceVariantText
+
+                                        MouseArea {
+                                            anchors.fill: parent
+                                            enabled: pRow.isSelf
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: root.sendBridgeCommand({cmd: "set_voice_settings",
+                                                                               mute: !root.isMuted})
+                                        }
+                                    }
+                                    DankIcon {
+                                        visible: pRow.isSelf || pRow.headOff
+                                        name: pRow.headOff ? "headset_off" : "headset"
+                                        size: 16
+                                        color: pRow.headOff ? Theme.error : Theme.surfaceVariantText
+
+                                        MouseArea {
+                                            anchors.fill: parent
+                                            enabled: pRow.isSelf
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: root.sendBridgeCommand({cmd: "set_voice_settings",
+                                                                               deaf: !root.isDeafened})
+                                        }
+                                    }
+                                    // Same glyph Discord uses, tinted amber to
+                                    // separate "no permission to speak here"
+                                    // from the red self/server mute.
+                                    DankIcon {
+                                        visible: modelData.suppress === true && !pRow.micOff
+                                        name: "mic_off"
+                                        size: 16
+                                        color: Theme.warning
+                                    }
                                 }
-                            }
-                        }
-                    }
-
-                    // Mute / deafen controls
-                    Row {
-                        width: parent.width
-                        spacing: Theme.spacingS
-                        topPadding: Theme.spacingS
-
-                        Rectangle {
-                            width: (parent.width - Theme.spacingS) / 2
-                            height: 40
-                            radius: Theme.cornerRadius
-                            color: root.isMuted ? Theme.error : Theme.surfaceContainerHigh
-
-                            Row {
-                                anchors.centerIn: parent
-                                spacing: Theme.spacingXS
-
-                                DankIcon {
-                                    name: root.isMuted ? "mic_off" : "mic"
-                                    size: 18
-                                    color: root.isMuted ? (Theme.onError || "white") : Theme.surfaceText
-                                    anchors.verticalCenter: parent.verticalCenter
-                                }
-                                StyledText {
-                                    text: root.isMuted ? "Unmute" : "Mute"
-                                    color: root.isMuted ? (Theme.onError || "white") : Theme.surfaceText
-                                    font.pixelSize: Theme.fontSizeSmall
-                                    anchors.verticalCenter: parent.verticalCenter
-                                }
-                            }
-
-                            MouseArea {
-                                anchors.fill: parent
-                                cursorShape: Qt.PointingHandCursor
-                                onClicked: root.sendBridgeCommand({cmd: "set_voice_settings", mute: !root.isMuted})
-                            }
-                        }
-
-                        Rectangle {
-                            width: (parent.width - Theme.spacingS) / 2
-                            height: 40
-                            radius: Theme.cornerRadius
-                            color: root.isDeafened ? Theme.error : Theme.surfaceContainerHigh
-
-                            Row {
-                                anchors.centerIn: parent
-                                spacing: Theme.spacingXS
-
-                                DankIcon {
-                                    name: root.isDeafened ? "headset_off" : "headset"
-                                    size: 18
-                                    color: root.isDeafened ? (Theme.onError || "white") : Theme.surfaceText
-                                    anchors.verticalCenter: parent.verticalCenter
-                                }
-                                StyledText {
-                                    text: root.isDeafened ? "Undeafen" : "Deafen"
-                                    color: root.isDeafened ? (Theme.onError || "white") : Theme.surfaceText
-                                    font.pixelSize: Theme.fontSizeSmall
-                                    anchors.verticalCenter: parent.verticalCenter
-                                }
-                            }
-
-                            MouseArea {
-                                anchors.fill: parent
-                                cursorShape: Qt.PointingHandCursor
-                                onClicked: root.sendBridgeCommand({cmd: "set_voice_settings", deaf: !root.isDeafened})
                             }
                         }
                     }
