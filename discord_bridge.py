@@ -453,6 +453,7 @@ class DiscordBridge:
         self._last_silent_reauth = 0.0
         self._shutdown = False
         self._discord_task: asyncio.Task[None] | None = None
+        self._connect_lock = asyncio.Lock()
 
     # -- main entry --
 
@@ -608,6 +609,9 @@ class DiscordBridge:
             log.error("Discord read loop error: %s", e)
         finally:
             self.discord.close()
+            # Nothing can answer these now, and a leftover AUTHENTICATE nonce
+            # makes the reconnect loop skip forever.
+            self._pending.clear()
             self.authenticated = False
             self.current_user = {}
             self.current_channel_id = None
@@ -972,33 +976,40 @@ class DiscordBridge:
         when it attaches, so repeat calls while already connected or mid-auth
         must not tear down or duplicate anything.
 
+        Serialized, because the idempotence checks below only hold once the
+        handshake has finished. A second caller arriving mid-handshake sees a
+        live writer, no `authenticated` and nothing pending, so it starts a
+        second reader on the same stream and steals the READY frame the
+        handshake is waiting for.
+
         `quiet` is used by the background reconnect loop: Discord-not-running
         failures stay silent, and a missing token doesn't re-broadcast
         `auth_required` (which the widget already shows).
         """
-        if self.discord.connected:
-            if self.authenticated or "AUTHENTICATE" in self._pending.values():
-                # Already connected (or auth in flight); new clients get
-                # state via the connection replay.
+        async with self._connect_lock:
+            if self.discord.connected:
+                if self.authenticated or "AUTHENTICATE" in self._pending.values():
+                    # Already connected (or auth in flight); new clients get
+                    # state via the connection replay.
+                    return
+            elif not await self._connect_discord(quiet=quiet):
                 return
-        elif not await self._connect_discord(quiet=quiet):
-            return
 
-        # Start reading from Discord in background (only one loop).
-        if self._discord_task is None or self._discord_task.done():
-            self._discord_task = asyncio.create_task(self._discord_read_loop())
+            # Start reading from Discord in background (only one loop).
+            if self._discord_task is None or self._discord_task.done():
+                self._discord_task = asyncio.create_task(self._discord_read_loop())
 
-        # Try cached token, then fall back to re-authorizing on prior consent.
-        token = self.tokens.load()
-        if token:
-            nonce = await self.discord.authenticate(token)
-            self._pending[nonce] = "AUTHENTICATE"
-        elif self.tokens.consented and self._may_silently_reauth():
-            log.info("No cached token but prior consent recorded; re-authorizing")
-            nonce = await self.discord.authorize(self.client_id, OAUTH_SCOPES)
-            self._pending[nonce] = "AUTHORIZE"
-        elif not quiet and not self.tokens.consented:
-            await self.server.send({"type": "auth_required"})
+            # Try cached token, then fall back to re-authorizing on prior consent.
+            token = self.tokens.load()
+            if token:
+                nonce = await self.discord.authenticate(token)
+                self._pending[nonce] = "AUTHENTICATE"
+            elif self.tokens.consented and self._may_silently_reauth():
+                log.info("No cached token but prior consent recorded; re-authorizing")
+                nonce = await self.discord.authorize(self.client_id, OAUTH_SCOPES)
+                self._pending[nonce] = "AUTHORIZE"
+            elif not quiet and not self.tokens.consented:
+                await self.server.send({"type": "auth_required"})
 
 
 # ---------------------------------------------------------------------------

@@ -1,10 +1,11 @@
+import asyncio
 import os
 import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from discord_bridge import _user_voice_args, _voice_entry_fields
+from discord_bridge import DiscordBridge, _user_voice_args, _voice_entry_fields
 
 
 class VoiceEntryFieldsTests(unittest.TestCase):
@@ -61,6 +62,73 @@ class UserVoiceArgsTests(unittest.TestCase):
 
     def test_only_includes_provided_fields(self):
         self.assertEqual(_user_voice_args({"user_id": "1"}), {"user_id": "1"})
+
+
+class FakeIPC:
+    """Stand-in for DiscordIPC with a handshake slow enough to interleave."""
+
+    def __init__(self, eof: bool = False) -> None:
+        self.is_connected = False
+        self.eof = eof
+        self.handshakes = 0
+        self.authenticates = 0
+        self._nonce = 0
+
+    @property
+    def connected(self) -> bool:
+        return self.is_connected
+
+    async def connect(self) -> bool:
+        self.is_connected = True
+        return True
+
+    async def handshake(self, client_id: str) -> dict:
+        self.handshakes += 1
+        await asyncio.sleep(0.01)
+        return {"evt": "READY"}
+
+    async def authenticate(self, token: str) -> str:
+        self.authenticates += 1
+        self._nonce += 1
+        return str(self._nonce)
+
+    async def recv_frame(self):
+        if self.eof:
+            raise asyncio.IncompleteReadError(b"", 8)
+        await asyncio.sleep(3600)
+
+    def close(self) -> None:
+        self.is_connected = False
+
+
+def _bridge(fake: FakeIPC) -> DiscordBridge:
+    bridge = DiscordBridge("/nonexistent/dms-discord-voice-test.sock")
+    bridge.discord = fake
+    bridge.tokens.load = lambda: "token"
+    bridge.tokens.consented = True
+    return bridge
+
+
+class ConnectFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_concurrent_connects_authenticate_once(self):
+        fake = FakeIPC()
+        bridge = _bridge(fake)
+        try:
+            await asyncio.gather(bridge._do_connect_flow(), bridge._do_connect_flow())
+            self.assertEqual(fake.handshakes, 1)
+            self.assertEqual(fake.authenticates, 1)
+        finally:
+            if bridge._discord_task:
+                bridge._discord_task.cancel()
+
+    async def test_disconnect_clears_pending(self):
+        fake = FakeIPC(eof=True)
+        bridge = _bridge(fake)
+        fake.is_connected = True
+        bridge._pending["1"] = "AUTHENTICATE"
+        await bridge._discord_read_loop()
+        self.assertEqual(bridge._pending, {})
+        self.assertFalse(bridge.authenticated)
 
 
 if __name__ == "__main__":
